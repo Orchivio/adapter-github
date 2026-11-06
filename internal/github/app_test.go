@@ -237,3 +237,48 @@ func TestOpenPullRequestPostsHeadAndBase(t *testing.T) {
 		t.Fatalf("token req = %+v", p)
 	}
 }
+
+func prExistsStub(t *testing.T, list string, gotQuery *string, gotAuth *string) http.Handler {
+	t.Helper()
+	var tokReq []tokenReq
+	var n atomic.Int32
+	stub := githubStub(t, &tokReq, &n).(*http.ServeMux)
+	stub.HandleFunc("POST /repos/acme/playground/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(422)
+		io.WriteString(w, `{"message":"Validation Failed","errors":[{"message":"A pull request already exists for acme:orchivio/orc-1-abcd1234."}]}`)
+	})
+	stub.HandleFunc("GET /repos/acme/playground/pulls", func(w http.ResponseWriter, r *http.Request) {
+		*gotQuery = r.URL.RawQuery
+		*gotAuth = r.Header.Get("Authorization")
+		io.WriteString(w, list)
+	})
+	return stub
+}
+
+func TestOpenPullRequestReturnsExistingOpenPROn422(t *testing.T) {
+	var query, auth string
+	app, _ := newTestApp(t, prExistsStub(t, `[{"html_url":"https://github.com/acme/playground/pull/7","number":7}]`, &query, &auth))
+	url, num, err := app.OpenPullRequest(context.Background(), "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if url != "https://github.com/acme/playground/pull/7" || num != 7 {
+		t.Fatalf("%q %d", url, num)
+	}
+	if query != "head=acme%3Aorchivio%2Forc-1-abcd1234&state=open" {
+		t.Fatalf("query = %q", query)
+	}
+	if auth != "Bearer ghs_tok" {
+		t.Fatalf("auth = %q", auth)
+	}
+}
+
+func TestOpenPullRequestReturnsOriginal422WhenNoOpenPR(t *testing.T) {
+	var query, auth string
+	app, _ := newTestApp(t, prExistsStub(t, `[]`, &query, &auth))
+	_, _, err := app.OpenPullRequest(context.Background(), "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.status != 422 {
+		t.Fatalf("err = %v", err)
+	}
+}

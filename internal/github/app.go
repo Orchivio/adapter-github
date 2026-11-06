@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -242,21 +243,35 @@ func (a *App) InstallationToken(ctx context.Context, repos []string, write bool)
 	return a.mint(ctx, repos, map[string]string{"contents": contents, "metadata": "read"})
 }
 
+type pullRequest struct {
+	HTMLURL string `json:"html_url"`
+	Number  int64  `json:"number"`
+}
+
 // OpenPullRequest opens a PR using a token scoped to this single repo with pull_requests:write.
+// A follow-up run pushes to the same branch again; GitHub then answers 422 and the already
+// open PR for that head is returned instead.
 func (a *App) OpenPullRequest(ctx context.Context, repo, base, head, title, body string) (string, int64, error) {
-	if _, _, err := parseRepos([]string{repo}); err != nil {
+	owner, _, err := parseRepos([]string{repo})
+	if err != nil {
 		return "", 0, err
 	}
 	tok, _, err := a.mint(ctx, []string{repo}, map[string]string{"pull_requests": "write", "metadata": "read"})
 	if err != nil {
 		return "", 0, err
 	}
-	var out struct {
-		HTMLURL string `json:"html_url"`
-		Number  int64  `json:"number"`
-	}
+	var out pullRequest
 	err = a.do(ctx, http.MethodPost, "/repos/"+repo+"/pulls", tok,
 		map[string]string{"title": title, "head": head, "base": base, "body": body}, &out)
+	var ae *apiError
+	if errors.As(err, &ae) && ae.status == http.StatusUnprocessableEntity {
+		var open []pullRequest
+		q := url.Values{"head": {owner + ":" + head}, "state": {"open"}}
+		if lerr := a.do(ctx, http.MethodGet, "/repos/"+repo+"/pulls?"+q.Encode(), tok, nil, &open); lerr == nil && len(open) > 0 {
+			return open[0].HTMLURL, open[0].Number, nil
+		}
+		return "", 0, err
+	}
 	if err != nil {
 		return "", 0, err
 	}
