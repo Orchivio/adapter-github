@@ -23,7 +23,7 @@ import (
 const (
 	defaultAPI    = "https://api.github.com"
 	defaultCloneB = "https://github.com"
-	defaultAddr   = ":7201"
+	defaultAddr   = "127.0.0.1:7201" // insecure gRPC, bind localhost; mTLS before remote workers
 	stopTimeout   = 10 * time.Second
 )
 
