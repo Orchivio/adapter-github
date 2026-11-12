@@ -158,9 +158,18 @@ func (a *App) do(ctx context.Context, method, path, bearer string, in, out any) 
 		return fmt.Errorf("read github response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		var e struct{ Message string }
+		var e struct {
+			Message string
+			Errors  []struct{ Message string }
+		}
 		_ = json.Unmarshal(data, &e)
-		return &apiError{status: resp.StatusCode, message: e.Message}
+		msg := e.Message
+		for _, d := range e.Errors { // validation details, e.g. "not all refs are readable"
+			if d.Message != "" {
+				msg += ": " + d.Message
+			}
+		}
+		return &apiError{status: resp.StatusCode, message: msg}
 	}
 	if out == nil {
 		return nil
@@ -248,7 +257,8 @@ type pullRequest struct {
 	Number  int64  `json:"number"`
 }
 
-// OpenPullRequest opens a PR using a token scoped to this single repo with pull_requests:write.
+// OpenPullRequest opens a PR using a token scoped to this single repo with pull_requests:write
+// and contents:read (GitHub must read head and base, else 422 "not all refs are readable").
 // A follow-up run pushes to the same branch again; GitHub then answers 422 and the already
 // open PR for that head is returned instead.
 func (a *App) OpenPullRequest(ctx context.Context, repo, base, head, title, body string) (string, int64, error) {
@@ -256,7 +266,7 @@ func (a *App) OpenPullRequest(ctx context.Context, repo, base, head, title, body
 	if err != nil {
 		return "", 0, err
 	}
-	tok, _, err := a.mint(ctx, []string{repo}, map[string]string{"pull_requests": "write", "metadata": "read"})
+	tok, _, err := a.mint(ctx, []string{repo}, map[string]string{"pull_requests": "write", "contents": "read", "metadata": "read"})
 	if err != nil {
 		return "", 0, err
 	}

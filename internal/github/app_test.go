@@ -233,7 +233,7 @@ func TestOpenPullRequestPostsHeadAndBase(t *testing.T) {
 	}
 	p := tokReq[0]
 	if len(p.Repositories) != 1 || p.Repositories[0] != "playground" || p.Permissions["pull_requests"] != "write" ||
-		p.Permissions["metadata"] != "read" || len(p.Permissions) != 2 {
+		p.Permissions["metadata"] != "read" || p.Permissions["contents"] != "read" || len(p.Permissions) != 3 {
 		t.Fatalf("token req = %+v", p)
 	}
 }
@@ -279,6 +279,19 @@ func TestOpenPullRequestReturnsOriginal422WhenNoOpenPR(t *testing.T) {
 	_, _, err := app.OpenPullRequest(context.Background(), "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
 	var ae *apiError
 	if !errors.As(err, &ae) || ae.status != 422 {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAPIErrorIncludesValidationDetails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.Write([]byte(`{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"not all refs are readable"}]}`))
+	}))
+	defer srv.Close()
+	a := &App{hc: srv.Client(), apiURL: srv.URL}
+	err := a.do(context.Background(), http.MethodGet, "/x", "tok", nil, nil)
+	if err == nil || err.Error() != "GitHub API 422: Validation Failed: not all refs are readable" {
 		t.Fatalf("err = %v", err)
 	}
 }
