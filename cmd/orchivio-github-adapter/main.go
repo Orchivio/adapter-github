@@ -12,12 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	pluginv1 "github.com/soemii/orchivio-server/contract/gen/orchivio/plugin/v1"
-	"github.com/soemii/orchivio-server/contract/secretref"
+	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
+	"github.com/orchivio/orchestrator/contract/secretref"
 	"google.golang.org/grpc"
 
-	"github.com/soemii/orchivio-adapter-github/internal/github"
-	"github.com/soemii/orchivio-adapter-github/internal/server"
+	"github.com/orchivio/adapter-github/internal/github"
+	"github.com/orchivio/adapter-github/internal/server"
 )
 
 const (

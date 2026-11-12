@@ -6,12 +6,12 @@ import (
 	"errors"
 	"time"
 
-	pluginv1 "github.com/soemii/orchivio-server/contract/gen/orchivio/plugin/v1"
+	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/soemii/orchivio-adapter-github/internal/github"
+	"github.com/orchivio/adapter-github/internal/github"
 )
 
 const tokenUsername = "x-access-token"
