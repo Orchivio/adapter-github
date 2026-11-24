@@ -25,9 +25,21 @@ const (
 	soemiiID         = 179956010
 )
 
+// account describes who owns the installation and who confirms it.
+type account struct {
+	Type, Login  string // installation account
+	UserLogin    string // GET /user
+	MemberStatus int    // GET /user/memberships/orgs/{org}; 0 means 200
+	MemberRole   string
+	MemberState  string
+}
+
+// soemiiUser is a user installation confirmed by its owner (login differs in case only).
+var soemiiUser = account{Type: "User", Login: "Soemii", UserLogin: "soemii"}
+
 // connectStub fakes the OAuth endpoint and the API calls of the connect flow.
 // The user sees the installations in userIDs, served on page 2 after a full page 1.
-func connectStub(t *testing.T, userIDs []int64, slugCalls *atomic.Int32) *http.ServeMux {
+func connectStub(t *testing.T, userIDs []int64, slugCalls *atomic.Int32, acct account) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +77,24 @@ func connectStub(t *testing.T, userIDs []int64, slugCalls *atomic.Int32) *http.S
 		if r.Header.Get("Authorization") == "Bearer "+testUserToken {
 			t.Error("installation lookup must use the app JWT")
 		}
-		fmt.Fprintf(w, `{"id":%s,"account":{"login":"Soemii"}}`, r.PathValue("id"))
+		fmt.Fprintf(w, `{"id":%s,"account":{"login":%q,"type":%q}}`, r.PathValue("id"), acct.Login, acct.Type)
+	})
+	mux.HandleFunc("GET /user", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+testUserToken {
+			t.Errorf("GET /user must use the user token")
+		}
+		fmt.Fprintf(w, `{"login":%q}`, acct.UserLogin)
+	})
+	mux.HandleFunc("GET /user/memberships/orgs/{org}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+testUserToken || r.PathValue("org") != acct.Login {
+			t.Errorf("bad membership request %v %q", r.Header, r.PathValue("org"))
+		}
+		if acct.MemberStatus != 0 {
+			w.WriteHeader(acct.MemberStatus)
+			io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"state":%q,"role":%q,"organization":{"login":%q}}`, acct.MemberState, acct.MemberRole, acct.Login)
 	})
 	mux.HandleFunc("GET /app", func(w http.ResponseWriter, r *http.Request) {
 		slugCalls.Add(1)
@@ -88,7 +117,7 @@ func newConnectApp(t *testing.T, h http.Handler, webURL string) *App {
 
 func TestBeginConnectUsesAppSlugAndState(t *testing.T) {
 	var slugCalls atomic.Int32
-	app := newConnectApp(t, connectStub(t, nil, &slugCalls), "https://github.com")
+	app := newConnectApp(t, connectStub(t, nil, &slugCalls, soemiiUser), "https://github.com")
 	for range 2 {
 		got, err := app.BeginConnect(context.Background(), "s1")
 		if err != nil {
@@ -105,7 +134,7 @@ func TestBeginConnectUsesAppSlugAndState(t *testing.T) {
 
 func TestBeginConnectRequiresState(t *testing.T) {
 	var slugCalls atomic.Int32
-	app := newConnectApp(t, connectStub(t, nil, &slugCalls), "https://github.com")
+	app := newConnectApp(t, connectStub(t, nil, &slugCalls, soemiiUser), "https://github.com")
 	if _, err := app.BeginConnect(context.Background(), ""); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("err = %v", err)
 	}
@@ -117,7 +146,7 @@ func completeQuery() map[string]string {
 
 func TestCompleteConnectReturnsInstallationCredential(t *testing.T) {
 	var slugCalls atomic.Int32
-	app := newConnectApp(t, connectStub(t, []int64{soemiiID}, &slugCalls), "")
+	app := newConnectApp(t, connectStub(t, []int64{soemiiID}, &slugCalls, soemiiUser), "")
 	inst, err := app.CompleteConnect(context.Background(), testRedirect, completeQuery())
 	if err != nil {
 		t.Fatal(err)
@@ -133,7 +162,7 @@ func TestCompleteConnectReturnsInstallationCredential(t *testing.T) {
 
 func TestCompleteConnectRejectsInstallationUserCannotAccess(t *testing.T) {
 	var slugCalls atomic.Int32
-	app := newConnectApp(t, connectStub(t, []int64{42}, &slugCalls), "")
+	app := newConnectApp(t, connectStub(t, []int64{42}, &slugCalls, soemiiUser), "")
 	inst, err := app.CompleteConnect(context.Background(), testRedirect, completeQuery())
 	if !errors.Is(err, ErrAccessDenied) || inst != (Installation{}) {
 		t.Fatalf("inst=%+v err=%v", inst, err)
@@ -141,9 +170,48 @@ func TestCompleteConnectRejectsInstallationUserCannotAccess(t *testing.T) {
 	assertNoSecrets(t, err)
 }
 
+func TestCompleteConnectRequiresInstallationAdmin(t *testing.T) {
+	org := account{Type: "Organization", Login: "Orchivio", UserLogin: "someone", MemberState: "active"}
+	cases := []struct {
+		name string
+		acct account
+		want error // nil means success
+	}{
+		{"org admin", withRole(org, "admin", "active", 0), nil},
+		{"org member", withRole(org, "member", "active", 0), ErrAccessDenied},
+		{"pending org admin", withRole(org, "admin", "pending", 0), ErrAccessDenied},
+		{"no membership", withRole(org, "", "", http.StatusNotFound), ErrAccessDenied},
+		{"membership forbidden", withRole(org, "", "", http.StatusForbidden), ErrAccessDenied},
+		{"user installation by owner", soemiiUser, nil},
+		{"user installation by another user", account{Type: "User", Login: "Soemii", UserLogin: "mallory"}, ErrAccessDenied},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var slugCalls atomic.Int32
+			app := newConnectApp(t, connectStub(t, []int64{soemiiID}, &slugCalls, c.acct), "")
+			inst, err := app.CompleteConnect(context.Background(), testRedirect, completeQuery())
+			if c.want == nil {
+				if err != nil || inst != (Installation{ID: soemiiID, Account: c.acct.Login}) {
+					t.Fatalf("inst=%+v err=%v", inst, err)
+				}
+				return
+			}
+			if !errors.Is(err, c.want) || inst != (Installation{}) {
+				t.Fatalf("inst=%+v err=%v", inst, err)
+			}
+			assertNoSecrets(t, err)
+		})
+	}
+}
+
+func withRole(a account, role, state string, status int) account {
+	a.MemberRole, a.MemberState, a.MemberStatus = role, state, status
+	return a
+}
+
 func TestCompleteConnectWithoutInstallationIDIsPendingApproval(t *testing.T) {
 	var slugCalls atomic.Int32
-	app := newConnectApp(t, connectStub(t, nil, &slugCalls), "")
+	app := newConnectApp(t, connectStub(t, nil, &slugCalls, soemiiUser), "")
 	_, err := app.CompleteConnect(context.Background(), testRedirect, map[string]string{"code": testCode, "setup_action": "request"})
 	if !errors.Is(err, ErrPendingApproval) || err.Error() != "installation pending approval by an organization owner" {
 		t.Fatalf("err = %v", err)
@@ -152,7 +220,7 @@ func TestCompleteConnectWithoutInstallationIDIsPendingApproval(t *testing.T) {
 
 func TestCompleteConnectRejectsBadInput(t *testing.T) {
 	var slugCalls atomic.Int32
-	app := newConnectApp(t, connectStub(t, []int64{soemiiID}, &slugCalls), "")
+	app := newConnectApp(t, connectStub(t, []int64{soemiiID}, &slugCalls, soemiiUser), "")
 	cases := []map[string]string{
 		{"installation_id": "1"},                       // no code
 		{"code": testCode, "installation_id": "abc"},   // not a number

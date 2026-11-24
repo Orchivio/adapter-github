@@ -20,7 +20,16 @@ var (
 	ErrPendingApproval = errors.New("installation pending approval by an organization owner")
 	// ErrAccessDenied marks an installation the authorizing GitHub user cannot access.
 	ErrAccessDenied = errors.New("github user has no access to this installation")
+
+	errNotOrgAdmin = deniedError("only an organization admin can connect this installation")
+	errNotOwner    = deniedError("only the account owner can connect this installation")
 )
+
+// deniedError is an ErrAccessDenied with its own message.
+type deniedError string
+
+func (e deniedError) Error() string        { return string(e) }
+func (e deniedError) Is(target error) bool { return target == ErrAccessDenied }
 
 // BeginConnect returns the App's install page; GitHub sends state back to the callback.
 func (a *App) BeginConnect(ctx context.Context, state string) (string, error) {
@@ -56,8 +65,10 @@ func (a *App) appSlug(ctx context.Context) (string, error) {
 }
 
 // CompleteConnect handles the install callback: it proves via the user's OAuth code that
-// the user can access installation_id, then returns that installation. The user token is
-// used for that one check only and dropped.
+// the user sees installation_id and controls its account (the user itself, or an active
+// admin of the organization), then returns that installation. Seeing it alone is not
+// enough: read access to one repo lists the installation too. The user token is used for
+// these checks only and dropped.
 func (a *App) CompleteConnect(ctx context.Context, redirectURI string, query map[string]string) (Installation, error) {
 	rawID := query["installation_id"]
 	if rawID == "" {
@@ -86,12 +97,43 @@ func (a *App) CompleteConnect(ctx context.Context, redirectURI string, query map
 		return Installation{}, err
 	}
 	var inst struct {
-		Account struct{ Login string }
+		Account struct{ Login, Type string }
 	}
 	if err := a.do(ctx, http.MethodGet, fmt.Sprintf("/app/installations/%d", id), jwt, nil, &inst); err != nil {
 		return Installation{}, err
 	}
+	if err := a.requireAccountControl(ctx, userToken, inst.Account.Type, inst.Account.Login); err != nil {
+		return Installation{}, err
+	}
 	return Installation{ID: id, Account: inst.Account.Login}, nil
+}
+
+// requireAccountControl checks the user owns the account (type "User") or is an active
+// org admin (type "Organization"; needs the App permission Members: Read-only).
+func (a *App) requireAccountControl(ctx context.Context, userToken, accountType, login string) error {
+	if accountType == "User" {
+		var me struct{ Login string }
+		if err := a.do(ctx, http.MethodGet, "/user", userToken, nil, &me); err != nil {
+			return err
+		}
+		if me.Login == "" || !strings.EqualFold(me.Login, login) {
+			return errNotOwner
+		}
+		return nil
+	}
+	var m struct{ State, Role string }
+	err := a.do(ctx, http.MethodGet, "/user/memberships/orgs/"+url.PathEscape(login), userToken, nil, &m)
+	var ae *apiError
+	if errors.As(err, &ae) && (ae.status == http.StatusNotFound || ae.status == http.StatusForbidden) {
+		return errNotOrgAdmin
+	}
+	if err != nil {
+		return err
+	}
+	if m.State != "active" || m.Role != "admin" {
+		return errNotOrgAdmin
+	}
+	return nil
 }
 
 // exchangeCode trades the OAuth code for a user token. Errors carry GitHub's error code only.
