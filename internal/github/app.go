@@ -35,8 +35,8 @@ const (
 var (
 	// ErrInvalidInput marks caller errors (bad repo list etc.).
 	ErrInvalidInput = errors.New("invalid input")
-	// ErrNotInstalled marks a missing App installation for an owner.
-	ErrNotInstalled = errors.New("github app not installed")
+	// ErrNotInstalled marks a repo owner without a connected installation in the credentials.
+	ErrNotInstalled = errors.New("no connected installation")
 
 	repoPattern = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 )
@@ -44,28 +44,67 @@ var (
 // NotInstalledError carries the owner without any GitHub response detail.
 type NotInstalledError struct{ Owner string }
 
-func (e *NotInstalledError) Error() string        { return "GitHub App not installed for " + e.Owner }
+func (e *NotInstalledError) Error() string        { return "no connected installation for owner " + e.Owner }
 func (e *NotInstalledError) Is(target error) bool { return target == ErrNotInstalled }
 
-// App mints installation tokens and opens pull requests for one GitHub App.
-type App struct {
-	apiURL string
-	appID  int64
-	key    *rsa.PrivateKey
-	now    func() time.Time
-	hc     *http.Client
-
-	mu            sync.Mutex
-	installations map[string]int64 // lower-cased owner -> installation id
+// Config configures one GitHub App. WebURL hosts the install page and the OAuth
+// token endpoint (https://github.com); a nil HTTP gets a client with a 30s timeout.
+type Config struct {
+	APIURL, WebURL         string
+	AppID                  int64
+	Key                    *rsa.PrivateKey
+	ClientID, ClientSecret string
+	Now                    func() time.Time
+	HTTP                   *http.Client
 }
 
-// NewApp builds an App; a nil hc gets a client with a 30s timeout.
-func NewApp(apiURL string, appID int64, key *rsa.PrivateKey, now func() time.Time, hc *http.Client) *App {
+// App mints installation tokens, opens pull requests and connects installations for one
+// GitHub App. It keeps no per-tenant state: installations arrive with every call.
+type App struct {
+	apiURL, webURL         string
+	appID                  int64
+	key                    *rsa.PrivateKey
+	clientID, clientSecret string
+	now                    func() time.Time
+	hc                     *http.Client
+
+	mu   sync.Mutex
+	slug string // App slug from GET /app, fetched once
+}
+
+// NewApp builds an App from c.
+func NewApp(c Config) *App {
+	hc := c.HTTP
 	if hc == nil {
 		hc = &http.Client{Timeout: HTTPTimeout}
 	}
-	return &App{apiURL: strings.TrimRight(apiURL, "/"), appID: appID, key: key, now: now, hc: hc,
-		installations: map[string]int64{}}
+	return &App{apiURL: strings.TrimRight(c.APIURL, "/"), webURL: strings.TrimRight(c.WebURL, "/"),
+		appID: c.AppID, key: c.Key, clientID: c.ClientID, clientSecret: c.ClientSecret, now: c.Now, hc: hc}
+}
+
+// Installation is the per-tenant access record stored as Credential.data.
+type Installation struct {
+	ID      int64  `json:"installationId"`
+	Account string `json:"account"`
+}
+
+// ParseInstallation decodes Credential.data; errors never echo the data.
+func ParseInstallation(data []byte) (Installation, error) {
+	var i Installation
+	if err := json.Unmarshal(data, &i); err != nil || i.ID <= 0 || i.Account == "" {
+		return Installation{}, fmt.Errorf("%w: malformed credential", ErrInvalidInput)
+	}
+	return i, nil
+}
+
+// pick returns the installation whose account owns the repo (case-insensitive).
+func pick(installs []Installation, owner string) (Installation, error) {
+	for _, i := range installs {
+		if strings.EqualFold(i.Account, owner) {
+			return i, nil
+		}
+	}
+	return Installation{}, &NotInstalledError{Owner: owner}
 }
 
 // ParsePrivateKey parses a PKCS#1 or PKCS#8 RSA PEM. Errors never contain key material.
@@ -187,44 +226,19 @@ type apiError struct {
 
 func (e *apiError) Error() string { return fmt.Sprintf("GitHub API %d: %s", e.status, e.message) }
 
-func (a *App) installationID(ctx context.Context, owner, firstRepo string) (int64, error) {
-	key := strings.ToLower(owner)
-	a.mu.Lock()
-	id, ok := a.installations[key]
-	a.mu.Unlock()
-	if ok {
-		return id, nil
-	}
-	jwt, err := a.jwt()
-	if err != nil {
-		return 0, err
-	}
-	var out struct {
-		ID int64 `json:"id"`
-	}
-	err = a.do(ctx, http.MethodGet, "/repos/"+firstRepo+"/installation", jwt, nil, &out)
-	var ae *apiError
-	if errors.As(err, &ae) && ae.status == http.StatusNotFound {
-		return 0, &NotInstalledError{Owner: owner}
-	}
-	if err != nil {
-		return 0, err
-	}
-	a.mu.Lock()
-	a.installations[key] = out.ID
-	a.mu.Unlock()
-	return out.ID, nil
-}
-
-func (a *App) mint(ctx context.Context, repos []string, perms map[string]string) (string, time.Time, error) {
+func (a *App) mint(ctx context.Context, installs []Installation, repos []string, perms map[string]string) (string, time.Time, error) {
 	owner, names, err := parseRepos(repos)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	id, err := a.installationID(ctx, owner, repos[0])
+	inst, err := pick(installs, owner)
 	if err != nil {
 		return "", time.Time{}, err
 	}
+	return a.accessToken(ctx, inst.ID, map[string]any{"repositories": names, "permissions": perms})
+}
+
+func (a *App) accessToken(ctx context.Context, id int64, body map[string]any) (string, time.Time, error) {
 	jwt, err := a.jwt()
 	if err != nil {
 		return "", time.Time{}, err
@@ -233,9 +247,7 @@ func (a *App) mint(ctx context.Context, repos []string, perms map[string]string)
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
 	}
-	err = a.do(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", id), jwt,
-		map[string]any{"repositories": names, "permissions": perms}, &out)
-	if err != nil {
+	if err := a.do(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", id), jwt, body, &out); err != nil {
 		return "", time.Time{}, err
 	}
 	return out.Token, out.ExpiresAt, nil
@@ -244,12 +256,12 @@ func (a *App) mint(ctx context.Context, repos []string, perms map[string]string)
 // InstallationToken mints a fresh token limited to repos (all one owner).
 // write=true grants contents:write only; PRs need OpenPullRequest's own token.
 // ponytail: no caching; cache per (installation, repos, perms) until expiry-5m if rate limits bite.
-func (a *App) InstallationToken(ctx context.Context, repos []string, write bool) (string, time.Time, error) {
+func (a *App) InstallationToken(ctx context.Context, installs []Installation, repos []string, write bool) (string, time.Time, error) {
 	contents := "read"
 	if write {
 		contents = "write"
 	}
-	return a.mint(ctx, repos, map[string]string{"contents": contents, "metadata": "read"})
+	return a.mint(ctx, installs, repos, map[string]string{"contents": contents, "metadata": "read"})
 }
 
 type pullRequest struct {
@@ -261,12 +273,12 @@ type pullRequest struct {
 // and contents:read (GitHub must read head and base, else 422 "not all refs are readable").
 // A follow-up run pushes to the same branch again; GitHub then answers 422 and the already
 // open PR for that head is returned instead.
-func (a *App) OpenPullRequest(ctx context.Context, repo, base, head, title, body string) (string, int64, error) {
+func (a *App) OpenPullRequest(ctx context.Context, installs []Installation, repo, base, head, title, body string) (string, int64, error) {
 	owner, _, err := parseRepos([]string{repo})
 	if err != nil {
 		return "", 0, err
 	}
-	tok, _, err := a.mint(ctx, []string{repo}, map[string]string{"pull_requests": "write", "contents": "read", "metadata": "read"})
+	tok, _, err := a.mint(ctx, installs, []string{repo}, map[string]string{"pull_requests": "write", "contents": "read", "metadata": "read"})
 	if err != nil {
 		return "", 0, err
 	}

@@ -35,11 +35,11 @@ func newTestApp(t *testing.T, h http.Handler) (*App, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return NewApp(srv.URL, 123, testKey(t), func() time.Time { return fixedNow }, srv.Client()), srv
+	return NewApp(Config{APIURL: srv.URL, AppID: 123, Key: testKey(t), Now: func() time.Time { return fixedNow }, HTTP: srv.Client()}), srv
 }
 
 func TestJWTClaims(t *testing.T) {
-	app := NewApp("http://x", 123, testKey(t), func() time.Time { return fixedNow }, nil)
+	app := NewApp(Config{APIURL: "http://x", AppID: 123, Key: testKey(t), Now: func() time.Time { return fixedNow }})
 	tok, err := app.jwt()
 	if err != nil {
 		t.Fatal(err)
@@ -97,23 +97,18 @@ type tokenReq struct {
 	Permissions  map[string]string `json:"permissions"`
 }
 
-// githubStub serves installation lookup and token minting; records token requests.
-func githubStub(t *testing.T, got *[]tokenReq, lookups *atomic.Int32) http.Handler {
+// acme is the connected installation the tests use unless they say otherwise.
+var acme = []Installation{{ID: 77, Account: "acme"}}
+
+// githubStub serves token minting for installation 77; records token requests.
+func githubStub(t *testing.T, got *[]tokenReq, mints *atomic.Int32) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /repos/{owner}/{repo}/installation", func(w http.ResponseWriter, r *http.Request) {
-		lookups.Add(1)
+	mux.HandleFunc("POST /app/installations/77/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		mints.Add(1)
 		if r.Header.Get("Accept") != "application/vnd.github+json" || r.Header.Get("X-GitHub-Api-Version") != "2022-11-28" ||
 			!strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			t.Errorf("bad headers %v", r.Header)
 		}
-		if r.PathValue("owner") == "ghost" {
-			w.WriteHeader(404)
-			io.WriteString(w, `{"message":"Not Found"}`)
-			return
-		}
-		io.WriteString(w, `{"id":77}`)
-	})
-	mux.HandleFunc("POST /app/installations/77/access_tokens", func(w http.ResponseWriter, r *http.Request) {
 		var tr tokenReq
 		_ = json.NewDecoder(r.Body).Decode(&tr)
 		*got = append(*got, tr)
@@ -135,7 +130,7 @@ func TestInstallationTokenScopesReposAndPermission(t *testing.T) {
 		var got []tokenReq
 		var n atomic.Int32
 		app, _ := newTestApp(t, githubStub(t, &got, &n))
-		tok, exp, err := app.InstallationToken(context.Background(), []string{"acme/playground", "ACME/other", "acme/playground"}, c.write)
+		tok, exp, err := app.InstallationToken(context.Background(), acme, []string{"acme/playground", "ACME/other", "acme/playground"}, c.write)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,17 +147,19 @@ func TestInstallationTokenScopesReposAndPermission(t *testing.T) {
 	}
 }
 
-func TestInstallationIDCachedPerOwner(t *testing.T) {
-	var got []tokenReq
-	var n atomic.Int32
-	app, _ := newTestApp(t, githubStub(t, &got, &n))
-	for range 2 {
-		if _, _, err := app.InstallationToken(context.Background(), []string{"acme/a"}, false); err != nil {
-			t.Fatal(err)
-		}
+func TestIssueRepoCredentialsPicksInstallationByOwner(t *testing.T) {
+	var gotPath string
+	app, _ := newTestApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(201)
+		io.WriteString(w, `{"token":"ghs_tok","expires_at":"2026-01-02T04:04:05Z"}`)
+	}))
+	installs := []Installation{{ID: 1, Account: "Soemii"}, {ID: 2, Account: "Orchivio"}}
+	if _, _, err := app.InstallationToken(context.Background(), installs, []string{"orchivio/orchestrator"}, false); err != nil {
+		t.Fatal(err)
 	}
-	if n.Load() != 1 {
-		t.Fatalf("lookups = %d", n.Load())
+	if gotPath != "/app/installations/2/access_tokens" {
+		t.Fatalf("path = %q", gotPath)
 	}
 }
 
@@ -172,7 +169,7 @@ func TestInstallationTokenRejectsInvalidRepos(t *testing.T) {
 	app, _ := newTestApp(t, githubStub(t, &got, &n))
 	bad := [][]string{nil, {"a/b", "c/d"}, {"noslash"}, {"a/.."}, {"a/b/c"}, {"a/b c"}, {"../x"}}
 	for _, repos := range bad {
-		_, _, err := app.InstallationToken(context.Background(), repos, false)
+		_, _, err := app.InstallationToken(context.Background(), acme, repos, false)
 		if !errors.Is(err, ErrInvalidInput) {
 			t.Errorf("%v: err = %v", repos, err)
 		}
@@ -186,8 +183,8 @@ func TestInstallationTokenNotInstalled(t *testing.T) {
 	var got []tokenReq
 	var n atomic.Int32
 	app, _ := newTestApp(t, githubStub(t, &got, &n))
-	_, _, err := app.InstallationToken(context.Background(), []string{"ghost/x"}, false)
-	if !errors.Is(err, ErrNotInstalled) {
+	_, _, err := app.InstallationToken(context.Background(), acme, []string{"ghost/x"}, false)
+	if !errors.Is(err, ErrNotInstalled) || err.Error() != "no connected installation for owner ghost" || n.Load() != 0 {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -198,7 +195,7 @@ func TestAPIErrorShowsStatusAndMessageOnly(t *testing.T) {
 		w.WriteHeader(500)
 		io.WriteString(w, `{"message":"boom","other":"bodysecret"}`)
 	}))
-	_, _, err := app.InstallationToken(context.Background(), []string{"acme/a"}, false)
+	_, _, err := app.InstallationToken(context.Background(), acme, []string{"acme/a"}, false)
 	if err == nil || !strings.Contains(err.Error(), "500") || !strings.Contains(err.Error(), "boom") ||
 		strings.Contains(err.Error(), "secret") {
 		t.Fatalf("err = %v", err)
@@ -218,7 +215,7 @@ func TestOpenPullRequestPostsHeadAndBase(t *testing.T) {
 		io.WriteString(w, `{"html_url":"https://github.com/acme/playground/pull/9","number":9}`)
 	})
 	app, _ := newTestApp(t, stub)
-	url, num, err := app.OpenPullRequest(context.Background(), "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
+	url, num, err := app.OpenPullRequest(context.Background(), acme, "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +255,7 @@ func prExistsStub(t *testing.T, list string, gotQuery *string, gotAuth *string) 
 func TestOpenPullRequestReturnsExistingOpenPROn422(t *testing.T) {
 	var query, auth string
 	app, _ := newTestApp(t, prExistsStub(t, `[{"html_url":"https://github.com/acme/playground/pull/7","number":7}]`, &query, &auth))
-	url, num, err := app.OpenPullRequest(context.Background(), "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
+	url, num, err := app.OpenPullRequest(context.Background(), acme, "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +273,7 @@ func TestOpenPullRequestReturnsExistingOpenPROn422(t *testing.T) {
 func TestOpenPullRequestReturnsOriginal422WhenNoOpenPR(t *testing.T) {
 	var query, auth string
 	app, _ := newTestApp(t, prExistsStub(t, `[]`, &query, &auth))
-	_, _, err := app.OpenPullRequest(context.Background(), "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
+	_, _, err := app.OpenPullRequest(context.Background(), acme, "acme/playground", "main", "orchivio/orc-1-abcd1234", "T", "B")
 	var ae *apiError
 	if !errors.As(err, &ae) || ae.status != 422 {
 		t.Fatalf("err = %v", err)

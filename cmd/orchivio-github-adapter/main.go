@@ -22,6 +22,7 @@ import (
 
 const (
 	defaultAPI    = "https://api.github.com"
+	defaultWeb    = "https://github.com"
 	defaultCloneB = "https://github.com"
 	defaultAddr   = "127.0.0.1:7201" // insecure gRPC, bind localhost; mTLS before remote workers
 	stopTimeout   = 10 * time.Second
@@ -55,7 +56,18 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	app := github.NewApp(env("GITHUB_API_URL", defaultAPI), appID, key, time.Now, nil)
+	clientID := os.Getenv("GITHUB_CLIENT_ID")
+	if clientID == "" {
+		return fmt.Errorf("GITHUB_CLIENT_ID is required")
+	}
+	clientSecret, err := secretref.Env{Lookup: os.LookupEnv}.Resolve(os.Getenv("GITHUB_CLIENT_SECRET_REF"))
+	if err != nil {
+		return fmt.Errorf("resolve GITHUB_CLIENT_SECRET_REF: %w", err)
+	}
+	app := github.NewApp(github.Config{
+		APIURL: env("GITHUB_API_URL", defaultAPI), WebURL: env("GITHUB_OAUTH_URL", defaultWeb),
+		AppID: appID, Key: key, ClientID: clientID, ClientSecret: clientSecret, Now: time.Now,
+	})
 	lis, err := net.Listen("tcp", env("ORCHIVIO_GRPC_ADDR", defaultAddr))
 	if err != nil {
 		return err
