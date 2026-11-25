@@ -163,39 +163,56 @@ func (a *App) exchangeCode(ctx context.Context, redirectURI, code string) (strin
 	return out.AccessToken, nil
 }
 
-// CheckAccess returns the repos ("owner/name") no installation covers. Each installation's
-// repo list is fetched at most once per call.
+type repoName struct {
+	FullName string `json:"full_name"`
+}
+
+// CheckAccess returns the repos ("owner/name") no usable installation covers. Each
+// installation's repo list is fetched at most once per call.
 func (a *App) CheckAccess(ctx context.Context, installs []Installation, repos []string) ([]string, error) {
-	type repo struct {
-		FullName string `json:"full_name"`
-	}
-	listed := map[int64][]repo{}
+	listed := map[int64][]repoName{}
 	var denied []string
 	for _, r := range repos {
-		owner, _, err := parseRepos([]string{r})
+		ok, err := a.covers(ctx, installs, r, listed)
 		if err != nil {
-			denied = append(denied, r)
-			continue
+			return nil, err
 		}
-		inst, err := pick(installs, owner)
-		if err != nil {
-			denied = append(denied, r)
-			continue
-		}
-		if _, ok := listed[inst.ID]; !ok {
-			tok, _, err := a.accessToken(ctx, inst.ID, map[string]any{"permissions": map[string]string{"metadata": "read"}})
-			if err != nil {
-				return nil, err
-			}
-			if listed[inst.ID], err = listAll[repo](ctx, a, "/installation/repositories", "repositories", tok); err != nil {
-				return nil, err
-			}
-		}
-		if !slices.ContainsFunc(listed[inst.ID], func(x repo) bool { return strings.EqualFold(x.FullName, r) }) {
+		if !ok {
 			denied = append(denied, r)
 		}
 	}
 	return denied, nil
+}
+
+// covers reports whether an installation of r's owner lists r; listed caches the lists.
+func (a *App) covers(ctx context.Context, installs []Installation, r string, listed map[int64][]repoName) (bool, error) {
+	owner, _, err := parseRepos([]string{r})
+	if err != nil {
+		return false, nil
+	}
+	for _, inst := range pick(installs, owner) {
+		if _, ok := listed[inst.ID]; !ok {
+			if listed[inst.ID], err = a.installationRepos(ctx, inst.ID); err != nil {
+				return false, err
+			}
+		}
+		if slices.ContainsFunc(listed[inst.ID], func(x repoName) bool { return strings.EqualFold(x.FullName, r) }) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// installationRepos lists the repos of installation id; a removed or suspended one has none.
+func (a *App) installationRepos(ctx context.Context, id int64) ([]repoName, error) {
+	tok, _, err := a.accessToken(ctx, id, map[string]any{"permissions": map[string]string{"metadata": "read"}})
+	if gone(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return listAll[repoName](ctx, a, "/installation/repositories", "repositories", tok)
 }
 
 // listAll pages through a GitHub list response {"total_count":n,"<key>":[...]}.

@@ -293,3 +293,25 @@ func TestParseInstallation(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckAccessSkipsRemovedInstallationsOfSameOwner(t *testing.T) {
+	var mints atomic.Int32
+	stub := accessStub(t, map[int64][]string{2: {"acme/a"}}, &mints)
+	app := newConnectApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/1/access_tokens" {
+			w.WriteHeader(404)
+			io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		stub.ServeHTTP(w, r)
+	}), "")
+	both := []Installation{{ID: 1, Account: "acme"}, {ID: 2, Account: "ACME"}}
+	denied, err := app.CheckAccess(context.Background(), both, []string{"acme/a", "acme/b"})
+	if err != nil || !slices.Equal(denied, []string{"acme/b"}) {
+		t.Fatalf("denied = %v err = %v", denied, err)
+	}
+	denied, err = app.CheckAccess(context.Background(), both[:1], []string{"acme/a"})
+	if err != nil || !slices.Equal(denied, []string{"acme/a"}) {
+		t.Fatalf("only stale: denied = %v err = %v", denied, err)
+	}
+}

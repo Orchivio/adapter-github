@@ -184,7 +184,7 @@ func TestInstallationTokenNotInstalled(t *testing.T) {
 	var n atomic.Int32
 	app, _ := newTestApp(t, githubStub(t, &got, &n))
 	_, _, err := app.InstallationToken(context.Background(), acme, []string{"ghost/x"}, false)
-	if !errors.Is(err, ErrNotInstalled) || err.Error() != "no connected installation for owner ghost" || n.Load() != 0 {
+	if !errors.Is(err, ErrNotInstalled) || err.Error() != "no usable installation for owner ghost" || n.Load() != 0 {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -290,5 +290,53 @@ func TestAPIErrorIncludesValidationDetails(t *testing.T) {
 	err := a.do(context.Background(), http.MethodGet, "/x", "tok", nil, nil)
 	if err == nil || err.Error() != "GitHub API 422: Validation Failed: not all refs are readable" {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// staleStub answers 404 for removed installation 1, 403 for suspended 3 and mints for 2.
+func staleStub(minted *[]string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*minted = append(*minted, r.URL.Path)
+		switch r.URL.Path {
+		case "/app/installations/1/access_tokens":
+			w.WriteHeader(404)
+			io.WriteString(w, `{"message":"Not Found"}`)
+		case "/app/installations/3/access_tokens":
+			w.WriteHeader(403)
+			io.WriteString(w, `{"message":"This installation has been suspended"}`)
+		case "/app/installations/2/access_tokens":
+			w.WriteHeader(201)
+			io.WriteString(w, `{"token":"ghs_fresh","expires_at":"2026-01-02T04:04:05Z"}`)
+		case "/repos/acme/playground/pulls":
+			w.WriteHeader(201)
+			io.WriteString(w, `{"html_url":"https://github.com/acme/playground/pull/1","number":1}`)
+		}
+	})
+}
+
+func TestMintSkipsRemovedInstallationsOfSameOwner(t *testing.T) {
+	var paths []string
+	app, _ := newTestApp(t, staleStub(&paths))
+	installs := []Installation{{ID: 1, Account: "acme"}, {ID: 3, Account: "Acme"}, {ID: 2, Account: "ACME"}}
+	tok, _, err := app.InstallationToken(context.Background(), installs, []string{"acme/playground"}, false)
+	if err != nil || tok != "ghs_fresh" {
+		t.Fatalf("tok=%q err=%v", tok, err)
+	}
+	if _, _, err := app.OpenPullRequest(context.Background(), installs, "acme/playground", "main", "h", "T", "B"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMintWithOnlyRemovedInstallationsIsNotInstalled(t *testing.T) {
+	var paths []string
+	app, _ := newTestApp(t, staleStub(&paths))
+	installs := []Installation{{ID: 1, Account: "acme"}, {ID: 3, Account: "acme"}}
+	_, _, err := app.InstallationToken(context.Background(), installs, []string{"acme/playground"}, false)
+	if !errors.Is(err, ErrNotInstalled) || err.Error() != "no usable installation for owner acme" {
+		t.Fatalf("err = %v", err)
+	}
+	_, _, err = app.OpenPullRequest(context.Background(), installs, "acme/playground", "main", "h", "T", "B")
+	if !errors.Is(err, ErrNotInstalled) || len(paths) != 4 {
+		t.Fatalf("err = %v paths = %v", err, paths)
 	}
 }

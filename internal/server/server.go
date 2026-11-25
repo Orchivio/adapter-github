@@ -135,7 +135,7 @@ func installations(creds []*pluginv1.Credential) ([]github.Installation, error) 
 	return out, nil
 }
 
-// toStatus maps: invalid input -> InvalidArgument, owner without connected installation and
+// toStatus maps: invalid input -> InvalidArgument, owner without usable installation and
 // pending install request -> FailedPrecondition, user without access -> PermissionDenied,
 // everything else (GitHub 4xx/5xx, network) -> Unavailable. Messages come from our own
 // error types, which carry only status and GitHub's message, never tokens.

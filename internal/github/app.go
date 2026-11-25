@@ -35,8 +35,9 @@ const (
 var (
 	// ErrInvalidInput marks caller errors (bad repo list etc.).
 	ErrInvalidInput = errors.New("invalid input")
-	// ErrNotInstalled marks a repo owner without a connected installation in the credentials.
-	ErrNotInstalled = errors.New("no connected installation")
+	// ErrNotInstalled marks a repo owner without a usable installation in the credentials:
+	// none connected, or every connected one removed or suspended on GitHub.
+	ErrNotInstalled = errors.New("no usable installation")
 
 	repoPattern = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 )
@@ -44,7 +45,7 @@ var (
 // NotInstalledError carries the owner without any GitHub response detail.
 type NotInstalledError struct{ Owner string }
 
-func (e *NotInstalledError) Error() string        { return "no connected installation for owner " + e.Owner }
+func (e *NotInstalledError) Error() string        { return "no usable installation for owner " + e.Owner }
 func (e *NotInstalledError) Is(target error) bool { return target == ErrNotInstalled }
 
 // Config configures one GitHub App. WebURL hosts the install page and the OAuth
@@ -97,14 +98,22 @@ func ParseInstallation(data []byte) (Installation, error) {
 	return i, nil
 }
 
-// pick returns the installation whose account owns the repo (case-insensitive).
-func pick(installs []Installation, owner string) (Installation, error) {
+// pick returns, in order, the installations whose account owns the repo (case-insensitive).
+// An uninstall and reinstall leaves a removed and a fresh one for the same account.
+func pick(installs []Installation, owner string) []Installation {
+	var out []Installation
 	for _, i := range installs {
 		if strings.EqualFold(i.Account, owner) {
-			return i, nil
+			out = append(out, i)
 		}
 	}
-	return Installation{}, &NotInstalledError{Owner: owner}
+	return out
+}
+
+// gone reports whether GitHub refused an installation as removed (404) or suspended (403).
+func gone(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && (ae.status == http.StatusNotFound || ae.status == http.StatusForbidden)
 }
 
 // ParsePrivateKey parses a PKCS#1 or PKCS#8 RSA PEM. Errors never contain key material.
@@ -231,11 +240,13 @@ func (a *App) mint(ctx context.Context, installs []Installation, repos []string,
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	inst, err := pick(installs, owner)
-	if err != nil {
-		return "", time.Time{}, err
+	for _, inst := range pick(installs, owner) {
+		tok, exp, err := a.accessToken(ctx, inst.ID, map[string]any{"repositories": names, "permissions": perms})
+		if !gone(err) {
+			return tok, exp, err
+		}
 	}
-	return a.accessToken(ctx, inst.ID, map[string]any{"repositories": names, "permissions": perms})
+	return "", time.Time{}, &NotInstalledError{Owner: owner}
 }
 
 func (a *App) accessToken(ctx context.Context, id int64, body map[string]any) (string, time.Time, error) {

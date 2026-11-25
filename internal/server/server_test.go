@@ -121,7 +121,7 @@ func TestErrorsMapToGRPCCodes(t *testing.T) {
 func TestNotInstalledMessageNamesOwnerOnly(t *testing.T) {
 	s := New(&fakeHost{err: &github.NotInstalledError{Owner: "ghost"}}, "https://github.com")
 	_, err := s.IssueRepoCredentials(context.Background(), &pluginv1.IssueRepoCredentialsRequest{Repos: []string{"ghost/r"}, Credentials: acmeCreds})
-	if status.Code(err) != codes.FailedPrecondition || status.Convert(err).Message() != "no connected installation for owner ghost" {
+	if status.Code(err) != codes.FailedPrecondition || status.Convert(err).Message() != "no usable installation for owner ghost" {
 		t.Fatalf("%v", err)
 	}
 }
