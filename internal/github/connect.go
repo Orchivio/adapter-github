@@ -1,0 +1,237 @@
+package github
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+const perPage = 100
+
+var (
+	// ErrPendingApproval marks an install request a non-owner sent to an organization owner.
+	ErrPendingApproval = errors.New("installation pending approval by an organization owner")
+	// ErrAccessDenied marks an installation the authorizing GitHub user cannot access.
+	ErrAccessDenied = errors.New("github user has no access to this installation")
+
+	errNotOrgAdmin = deniedError("only an organization admin can connect this installation")
+	errNotOwner    = deniedError("only the account owner can connect this installation")
+)
+
+// deniedError is an ErrAccessDenied with its own message.
+type deniedError string
+
+func (e deniedError) Error() string        { return string(e) }
+func (e deniedError) Is(target error) bool { return target == ErrAccessDenied }
+
+// BeginConnect returns the App's install page; GitHub sends state back to the callback.
+func (a *App) BeginConnect(ctx context.Context, state string) (string, error) {
+	if state == "" {
+		return "", fmt.Errorf("%w: state required", ErrInvalidInput)
+	}
+	slug, err := a.appSlug(ctx)
+	if err != nil {
+		return "", err
+	}
+	return a.webURL + "/apps/" + url.PathEscape(slug) + "/installations/new?" + url.Values{"state": {state}}.Encode(), nil
+}
+
+func (a *App) appSlug(ctx context.Context) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock() // ponytail: holds the lock across one HTTP call, only until the first success
+	if a.slug != "" {
+		return a.slug, nil
+	}
+	jwt, err := a.jwt()
+	if err != nil {
+		return "", err
+	}
+	var out struct{ Slug string }
+	if err := a.do(ctx, http.MethodGet, "/app", jwt, nil, &out); err != nil {
+		return "", err
+	}
+	if out.Slug == "" {
+		return "", errors.New("GitHub API: app has no slug")
+	}
+	a.slug = out.Slug
+	return a.slug, nil
+}
+
+// CompleteConnect handles the install callback: it proves via the user's OAuth code that
+// the user sees installation_id and controls its account (the user itself, or an active
+// admin of the organization), then returns that installation. Seeing it alone is not
+// enough: read access to one repo lists the installation too. The user token is used for
+// these checks only and dropped.
+func (a *App) CompleteConnect(ctx context.Context, redirectURI string, query map[string]string) (Installation, error) {
+	rawID := query["installation_id"]
+	if rawID == "" {
+		return Installation{}, ErrPendingApproval
+	}
+	id, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || id <= 0 {
+		return Installation{}, fmt.Errorf("%w: invalid installation_id", ErrInvalidInput)
+	}
+	if query["code"] == "" {
+		return Installation{}, fmt.Errorf("%w: code required", ErrInvalidInput)
+	}
+	userToken, err := a.exchangeCode(ctx, redirectURI, query["code"])
+	if err != nil {
+		return Installation{}, err
+	}
+	visible, err := listAll[struct{ ID int64 }](ctx, a, "/user/installations", "installations", userToken)
+	if err != nil {
+		return Installation{}, err
+	}
+	if !slices.ContainsFunc(visible, func(i struct{ ID int64 }) bool { return i.ID == id }) {
+		return Installation{}, ErrAccessDenied
+	}
+	jwt, err := a.jwt()
+	if err != nil {
+		return Installation{}, err
+	}
+	var inst struct {
+		Account struct{ Login, Type string }
+	}
+	if err := a.do(ctx, http.MethodGet, fmt.Sprintf("/app/installations/%d", id), jwt, nil, &inst); err != nil {
+		return Installation{}, err
+	}
+	if err := a.requireAccountControl(ctx, userToken, inst.Account.Type, inst.Account.Login); err != nil {
+		return Installation{}, err
+	}
+	return Installation{ID: id, Account: inst.Account.Login}, nil
+}
+
+// requireAccountControl checks the user owns the account (type "User") or is an active
+// org admin (type "Organization"; needs the App permission Members: Read-only).
+func (a *App) requireAccountControl(ctx context.Context, userToken, accountType, login string) error {
+	if accountType == "User" {
+		var me struct{ Login string }
+		if err := a.do(ctx, http.MethodGet, "/user", userToken, nil, &me); err != nil {
+			return err
+		}
+		if me.Login == "" || !strings.EqualFold(me.Login, login) {
+			return errNotOwner
+		}
+		return nil
+	}
+	var m struct{ State, Role string }
+	err := a.do(ctx, http.MethodGet, "/user/memberships/orgs/"+url.PathEscape(login), userToken, nil, &m)
+	var ae *apiError
+	if errors.As(err, &ae) && (ae.status == http.StatusNotFound || ae.status == http.StatusForbidden) {
+		return errNotOrgAdmin
+	}
+	if err != nil {
+		return err
+	}
+	if m.State != "active" || m.Role != "admin" {
+		return errNotOrgAdmin
+	}
+	return nil
+}
+
+// exchangeCode trades the OAuth code for a user token. Errors carry GitHub's error code only.
+func (a *App) exchangeCode(ctx context.Context, redirectURI, code string) (string, error) {
+	form := url.Values{"client_id": {a.clientID}, "client_secret": {a.clientSecret}, "code": {code}, "redirect_uri": {redirectURI}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.webURL+"/login/oauth/access_token", strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", errors.New("build oauth request")
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := a.hc.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("oauth token exchange: %w", errors.Unwrap(err))
+	}
+	defer resp.Body.Close()
+	var out struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBody)).Decode(&out); err != nil || resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("oauth token exchange: status %d", resp.StatusCode)
+	}
+	if out.AccessToken == "" {
+		return "", fmt.Errorf("%w: oauth code rejected: %s", ErrInvalidInput, out.Error)
+	}
+	return out.AccessToken, nil
+}
+
+type repoName struct {
+	FullName string `json:"full_name"`
+}
+
+// CheckAccess returns the repos ("owner/name") no usable installation covers. Each
+// installation's repo list is fetched at most once per call.
+func (a *App) CheckAccess(ctx context.Context, installs []Installation, repos []string) ([]string, error) {
+	listed := map[int64][]repoName{}
+	var denied []string
+	for _, r := range repos {
+		ok, err := a.covers(ctx, installs, r, listed)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			denied = append(denied, r)
+		}
+	}
+	return denied, nil
+}
+
+// covers reports whether an installation of r's owner lists r; listed caches the lists.
+func (a *App) covers(ctx context.Context, installs []Installation, r string, listed map[int64][]repoName) (bool, error) {
+	owner, _, err := parseRepos([]string{r})
+	if err != nil {
+		return false, nil
+	}
+	for _, inst := range pick(installs, owner) {
+		if _, ok := listed[inst.ID]; !ok {
+			if listed[inst.ID], err = a.installationRepos(ctx, inst.ID); err != nil {
+				return false, err
+			}
+		}
+		if slices.ContainsFunc(listed[inst.ID], func(x repoName) bool { return strings.EqualFold(x.FullName, r) }) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// installationRepos lists the repos of installation id; a removed or suspended one has none.
+func (a *App) installationRepos(ctx context.Context, id int64) ([]repoName, error) {
+	tok, _, err := a.accessToken(ctx, id, map[string]any{"permissions": map[string]string{"metadata": "read"}})
+	if gone(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return listAll[repoName](ctx, a, "/installation/repositories", "repositories", tok)
+}
+
+// listAll pages through a GitHub list response {"total_count":n,"<key>":[...]}.
+func listAll[T any](ctx context.Context, a *App, path, key, bearer string) ([]T, error) {
+	var all []T
+	for page := 1; ; page++ {
+		var out map[string]json.RawMessage
+		if err := a.do(ctx, http.MethodGet, fmt.Sprintf("%s?per_page=%d&page=%d", path, perPage, page), bearer, nil, &out); err != nil {
+			return nil, err
+		}
+		var items []T
+		if raw, ok := out[key]; ok {
+			if err := json.Unmarshal(raw, &items); err != nil {
+				return nil, fmt.Errorf("decode github %s: %w", key, err)
+			}
+		}
+		all = append(all, items...)
+		if len(items) < perPage {
+			return all, nil
+		}
+	}
+}
