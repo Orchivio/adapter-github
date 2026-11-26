@@ -38,6 +38,10 @@ var (
 	// ErrNotInstalled marks a repo owner without a usable installation in the credentials:
 	// none connected, or every connected one removed or suspended on GitHub.
 	ErrNotInstalled = errors.New("no usable installation")
+	// ErrNotFound marks a GitHub 404, e.g. an unknown repo or pull request.
+	ErrNotFound = errors.New("not found")
+	// ErrUnauthenticated marks a GitHub 401: the App's JWT or token was rejected.
+	ErrUnauthenticated = errors.New("unauthenticated")
 
 	repoPattern = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 )
@@ -234,6 +238,11 @@ type apiError struct {
 }
 
 func (e *apiError) Error() string { return fmt.Sprintf("GitHub API %d: %s", e.status, e.message) }
+
+func (e *apiError) Is(target error) bool {
+	return (target == ErrNotFound && e.status == http.StatusNotFound) ||
+		(target == ErrUnauthenticated && e.status == http.StatusUnauthorized)
+}
 
 func (a *App) mint(ctx context.Context, installs []Installation, repos []string, perms map[string]string) (string, time.Time, error) {
 	owner, names, err := parseRepos(repos)

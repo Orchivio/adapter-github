@@ -10,8 +10,10 @@ import (
 	"time"
 
 	pluginv1 "github.com/orchivio/orchestrator/contract/gen/orchivio/plugin/v1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/orchivio/adapter-github/internal/github"
 )
@@ -49,6 +51,15 @@ func (f *fakeHost) CompleteConnect(_ context.Context, redirectURI string, query 
 func (f *fakeHost) CheckAccess(_ context.Context, installs []github.Installation, repos []string) ([]string, error) {
 	f.called, f.installs, f.repos = true, installs, repos
 	return []string{"Other/b"}, f.err
+}
+
+func (f *fakeHost) StreamReviews(_ context.Context, installs []github.Installation, repos []string, every <-chan time.Time, send func(github.ReviewEvent) error) error {
+	f.called, f.installs, f.repos = true, installs, repos
+	if f.err != nil {
+		return f.err
+	}
+	return send(github.ReviewEvent{ID: "ic:1", Repo: "acme/a", Branch: "orchivio/x", PRURL: "https://github.com/acme/a/pull/5",
+		ActorID: 11, Login: "alice", Body: "hi @orchivio", MentionsBot: true})
 }
 
 func cred(data string) *pluginv1.Credential { return &pluginv1.Credential{Data: []byte(data)} }
@@ -99,6 +110,8 @@ func TestErrorsMapToGRPCCodes(t *testing.T) {
 		{&github.NotInstalledError{Owner: "ghost"}, codes.FailedPrecondition},
 		{github.ErrPendingApproval, codes.FailedPrecondition},
 		{github.ErrAccessDenied, codes.PermissionDenied},
+		{fmt.Errorf("x: %w", github.ErrNotFound), codes.NotFound},
+		{fmt.Errorf("x: %w", github.ErrUnauthenticated), codes.Unauthenticated},
 		{errors.New("GitHub API 500: boom"), codes.Unavailable},
 	}
 	for _, c := range cases {
@@ -200,7 +213,73 @@ func TestCheckAccessWithoutCredentialsDeniesAll(t *testing.T) {
 
 func TestGetCapabilities(t *testing.T) {
 	c, _ := New(&fakeHost{}, "").GetCapabilities(context.Background(), &pluginv1.GetCapabilitiesRequest{})
-	if c.ContractVersion != "plugin.v1" || c.AdapterName != "github" || c.SupportsThreads || c.SupportsWebhooks {
+	if c.ContractVersion != "plugin.v1" || c.AdapterName != "github" || !c.SupportsReviewEvents || c.SupportsThreads || c.SupportsWebhooks {
 		t.Fatalf("%+v", c)
+	}
+}
+
+func TestIssueRepoCredentialsFillsTokens(t *testing.T) {
+	s := New(&fakeHost{}, "https://github.com")
+	got, err := s.IssueRepoCredentials(context.Background(), &pluginv1.IssueRepoCredentialsRequest{Repos: []string{"acme/a", "acme/b"}, Credentials: acmeCreds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CredentialId != "" || len(got.Tokens) != 2 {
+		t.Fatalf("%+v", got)
+	}
+	for _, r := range []string{"acme/a", "acme/b"} {
+		tok := got.Tokens[r]
+		if tok.GetUsername() != "x-access-token" || tok.GetToken() != "tok" || tok.GetExpiresAt().AsTime().Unix() != 1000 {
+			t.Errorf("%s: %+v", r, tok)
+		}
+	}
+}
+
+func TestRevokeRepoCredentialsIsNoop(t *testing.T) {
+	f := &fakeHost{}
+	_, err := New(f, "").RevokeRepoCredentials(context.Background(), &pluginv1.RevokeRepoCredentialsRequest{Credentials: acmeCreds})
+	if err != nil || f.called {
+		t.Fatalf("err=%v called=%v", err, f.called)
+	}
+}
+
+// eventStream is a CodeHostAdapter_StreamEventsServer that records sent events.
+type eventStream struct {
+	grpc.ServerStream
+	ctx  context.Context
+	sent []*pluginv1.CodeHostEvent
+}
+
+func (e *eventStream) Context() context.Context { return e.ctx }
+func (e *eventStream) Send(ev *pluginv1.CodeHostEvent) error {
+	e.sent = append(e.sent, ev)
+	return nil
+}
+
+func TestStreamEventsMapsReviewEvents(t *testing.T) {
+	f := &fakeHost{}
+	st := &eventStream{ctx: context.Background()}
+	if err := New(f, "").StreamEvents(&pluginv1.StreamCodeHostEventsRequest{Repos: []string{"acme/a"}, Credentials: acmeCreds}, st); err != nil {
+		t.Fatal(err)
+	}
+	want := &pluginv1.CodeHostEvent{ExternalId: "ic:1", Kind: pluginv1.CodeHostEvent_REVIEW_COMMENTED, Repo: "acme/a", Branch: "orchivio/x",
+		PrUrl: "https://github.com/acme/a/pull/5", Actor: &pluginv1.Actor{Id: "11", Username: "alice"}, Body: "hi @orchivio", MentionsBot: true}
+	if len(st.sent) != 1 || !proto.Equal(st.sent[0], want) {
+		t.Fatalf("sent %v", st.sent)
+	}
+	if !slices.Equal(f.repos, []string{"acme/a"}) || len(f.installs) != 1 {
+		t.Fatalf("host got %+v %v", f.installs, f.repos)
+	}
+}
+
+func TestStreamEventsValidatesAndMapsErrors(t *testing.T) {
+	st := &eventStream{ctx: context.Background()}
+	err := New(&fakeHost{}, "").StreamEvents(&pluginv1.StreamCodeHostEventsRequest{Repos: []string{"acme/a"}}, st)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("no credentials: %v", err)
+	}
+	err = New(&fakeHost{err: fmt.Errorf("x: %w", github.ErrInvalidInput)}, "").StreamEvents(&pluginv1.StreamCodeHostEventsRequest{Repos: []string{"bad"}, Credentials: acmeCreds}, st)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("bad repo: %v", err)
 	}
 }
