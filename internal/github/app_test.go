@@ -340,3 +340,14 @@ func TestMintWithOnlyRemovedInstallationsIsNotInstalled(t *testing.T) {
 		t.Fatalf("err = %v paths = %v", err, paths)
 	}
 }
+
+func TestInstallationTokenUnknownRepoIsNotFound(t *testing.T) {
+	app, _ := newTestApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		io.WriteString(w, `{"message":"There is at least one repository that does not exist or is not accessible to the parent installation."}`)
+	}))
+	_, _, err := app.InstallationToken(context.Background(), acme, []string{"acme/ghost"}, false)
+	if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("err = %v", err)
+	}
+}

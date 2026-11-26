@@ -241,13 +241,25 @@ func (e *apiError) Is(target error) bool {
 	return target == ErrNotFound && e.status == http.StatusNotFound
 }
 
+// mint returns a token limited to repos (all one owner). GitHub answers 422 when a repo
+// does not exist or is not accessible to the installation; that maps to ErrNotFound.
 func (a *App) mint(ctx context.Context, installs []Installation, repos []string, perms map[string]string) (string, time.Time, error) {
 	owner, names, err := parseRepos(repos)
 	if err != nil {
 		return "", time.Time{}, err
 	}
+	tok, exp, err := a.mintFor(ctx, installs, owner, map[string]any{"repositories": names, "permissions": perms})
+	var ae *apiError
+	if errors.As(err, &ae) && ae.status == http.StatusUnprocessableEntity {
+		return "", time.Time{}, fmt.Errorf("%w: %s", ErrNotFound, ae.message)
+	}
+	return tok, exp, err
+}
+
+// mintFor tries owner's installations in order, skipping removed or suspended ones.
+func (a *App) mintFor(ctx context.Context, installs []Installation, owner string, body map[string]any) (string, time.Time, error) {
 	for _, inst := range pick(installs, owner) {
-		tok, exp, err := a.accessToken(ctx, inst.ID, map[string]any{"repositories": names, "permissions": perms})
+		tok, exp, err := a.accessToken(ctx, inst.ID, body)
 		if !gone(err) {
 			return tok, exp, err
 		}
