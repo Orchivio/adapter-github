@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -173,7 +174,9 @@ func (a *App) pollReviews(ctx context.Context, installs []Installation, repos []
 			out = append(out, events...)
 		}
 		if err != nil {
-			delete(tokens, strings.ToLower(owner)) // a rejected token must not stick until expiry
+			if tokenRejected(err) { // a mint error caches nothing; a repo error (e.g. 404) keeps the token
+				delete(tokens, strings.ToLower(owner))
+			}
 			if ctx.Err() == nil {
 				slog.Warn("review poll failed", "repo", repo, "err", err.Error())
 			}
@@ -182,6 +185,12 @@ func (a *App) pollReviews(ctx context.Context, installs []Installation, repos []
 		cursors[repo] = next
 	}
 	return out
+}
+
+// tokenRejected reports a GitHub 401 or 403: the cached token itself may be bad.
+func tokenRejected(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && (ae.status == http.StatusUnauthorized || ae.status == http.StatusForbidden)
 }
 
 // reviewToken returns a read-only token for all repos of owner's installation, cached until

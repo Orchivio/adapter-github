@@ -355,3 +355,33 @@ func TestReviewTokenRemintsShortlyBeforeExpiry(t *testing.T) {
 		t.Fatalf("tok=%q err=%v mints=%d", tok, err, mints.Load())
 	}
 }
+
+func TestStreamEvictsTokenOnlyWhenRejected(t *testing.T) {
+	cases := []struct {
+		status    int
+		wantMints int32
+	}{
+		{http.StatusNotFound, 1},     // deleted repo: token stays cached
+		{http.StatusUnauthorized, 3}, // rejected token: minted again each poll
+		{http.StatusForbidden, 3},
+	}
+	for _, c := range cases {
+		mux := http.NewServeMux()
+		var mints atomic.Int32
+		mux.HandleFunc("POST /app/installations/77/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+			mints.Add(1)
+			io.WriteString(w, `{"token":"ghs_read","expires_at":"2026-01-02T04:04:05Z"}`)
+		})
+		mux.HandleFunc("GET /app", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{"slug":"orchivio"}`) })
+		mux.HandleFunc("GET /repos/acme/gone/pulls", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"message":"nope"}`, c.status)
+		})
+		app, _ := newTestApp(t, mux)
+
+		stream(t, app, 2, "acme/gone")
+
+		if mints.Load() != c.wantMints {
+			t.Errorf("status %d: mints = %d, want %d", c.status, mints.Load(), c.wantMints)
+		}
+	}
+}
