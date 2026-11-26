@@ -59,9 +59,14 @@ type ghReview struct {
 }
 
 type ghPull struct {
-	HTMLURL string `json:"html_url"`
-	Head    struct {
-		Ref string `json:"ref"`
+	HTMLURL   string    `json:"html_url"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Number    int64     `json:"number"`
+	Head      struct {
+		Ref  string `json:"ref"`
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
 	} `json:"head"`
 }
 
@@ -80,18 +85,24 @@ func (a *App) StreamReviews(ctx context.Context, installs []Installation, repos 
 		}
 		cursors[r] = a.now()
 	}
+	var b botMatcher
 	seen := map[string]time.Time{} // id -> updated; pruned once older than every window
 	for {
-		for _, e := range a.pollReviews(ctx, installs, cursors) {
-			if _, dup := seen[e.ID]; dup {
-				continue
-			}
-			if err := send(e); err != nil {
-				return err
-			}
-			seen[e.ID] = e.Updated
+		if b.mention == nil {
+			b = a.newBotMatcher(ctx)
 		}
-		prune(seen, cursors)
+		if b.mention != nil {
+			for _, e := range a.pollReviews(ctx, installs, repos, cursors, b) {
+				if _, dup := seen[e.ID]; dup {
+					continue
+				}
+				if err := send(e); err != nil {
+					return err
+				}
+				seen[e.ID] = e.Updated
+			}
+			prune(seen, cursors)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -101,6 +112,29 @@ func (a *App) StreamReviews(ctx context.Context, installs []Installation, repos 
 			}
 		}
 	}
+}
+
+// botMatcher recognizes the App's own comments and mentions of it; built once per stream.
+type botMatcher struct {
+	slug    string
+	mention *regexp.Regexp
+}
+
+// newBotMatcher fetches the App slug; on failure it logs and returns a zero matcher, retried next poll.
+func (a *App) newBotMatcher(ctx context.Context) botMatcher {
+	slug, err := a.appSlug(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("review poll: app slug", "err", err.Error())
+		}
+		return botMatcher{}
+	}
+	return botMatcher{slug: slug, mention: regexp.MustCompile(`(?i)@` + regexp.QuoteMeta(slug) + `(\[bot\])?([^A-Za-z0-9-]|$)`)}
+}
+
+// isOwn reports whether u is this App's bot user.
+func (b botMatcher) isOwn(u ghUser) bool {
+	return u.Type == "Bot" && strings.EqualFold(u.Login, b.slug+"[bot]")
 }
 
 // prune forgets ids updated before the oldest window; they cannot be listed again unedited.
@@ -120,20 +154,14 @@ func prune(seen, cursors map[string]time.Time) {
 
 // pollReviews fetches every repo from its cursor minus the overlap.
 // ponytail: one token per repo and poll; mint per owner and cache until expiry if rate limits bite.
-func (a *App) pollReviews(ctx context.Context, installs []Installation, cursors map[string]time.Time) []ReviewEvent {
-	slug, err := a.appSlug(ctx)
-	if err != nil {
-		slog.Warn("review poll: app slug", "err", err.Error())
-		return nil
-	}
-	mention := regexp.MustCompile(`(?i)@` + regexp.QuoteMeta(slug) + `(\[bot\])?([^A-Za-z0-9-]|$)`)
+func (a *App) pollReviews(ctx context.Context, installs []Installation, repos []string, cursors map[string]time.Time, b botMatcher) []ReviewEvent {
 	var out []ReviewEvent
-	for repo, cursor := range cursors {
+	for _, repo := range repos {
 		next := a.now()
 		tok, _, err := a.mint(ctx, installs, []string{repo}, reviewPerms)
 		if err == nil {
 			var events []ReviewEvent
-			events, err = a.repoReviews(ctx, tok, slug, mention, repo, cursor.Add(-reviewOverlap))
+			events, err = a.repoReviews(ctx, tok, b, repo, cursors[repo].Add(-reviewOverlap))
 			out = append(out, events...)
 		}
 		if err != nil {
@@ -147,8 +175,14 @@ func (a *App) pollReviews(ctx context.Context, installs []Installation, cursors 
 	return out
 }
 
-// repoReviews returns the events of one repo updated (reviews: submitted) since.
-func (a *App) repoReviews(ctx context.Context, tok, slug string, mention *regexp.Regexp, repo string, since time.Time) ([]ReviewEvent, error) {
+// repoReviews returns the events of one repo updated (reviews: submitted) since, on its open
+// orchivio/ PRs updated since. Comments and reviews bump a PR's updated_at, so this set
+// also finds a review submitted without any comment.
+func (a *App) repoReviews(ctx context.Context, tok string, b botMatcher, repo string, since time.Time) ([]ReviewEvent, error) {
+	pulls, err := a.orchivioPulls(ctx, tok, repo, since)
+	if err != nil || len(pulls) == 0 {
+		return nil, err
+	}
 	issueComments, err := listSince[ghComment](ctx, a, "/repos/"+repo+"/issues/comments", since, tok)
 	if err != nil {
 		return nil, err
@@ -157,74 +191,65 @@ func (a *App) repoReviews(ctx context.Context, tok, slug string, mention *regexp
 	if err != nil {
 		return nil, err
 	}
-	pulls := map[string]*ghPull{} // PR number -> PR on an orchivio/ branch, nil otherwise
 	var out []ReviewEvent
-	add := func(prefix string, id int64, number string, u ghUser, body string, updated time.Time) error {
-		pr, err := a.orchivioPull(ctx, tok, repo, number, pulls)
-		if err != nil || pr == nil || isOwn(u, slug) {
-			return err
+	add := func(prefix string, id int64, pr ghPull, u ghUser, body string, updated time.Time) {
+		if b.isOwn(u) {
+			return
 		}
 		out = append(out, ReviewEvent{ID: prefix + strconv.FormatInt(id, 10), Repo: repo, Branch: pr.Head.Ref, PRURL: pr.HTMLURL,
-			ActorID: u.ID, Login: u.Login, Body: body, MentionsBot: mention.MatchString(body), Updated: updated})
-		return nil
+			ActorID: u.ID, Login: u.Login, Body: body, MentionsBot: b.mention.MatchString(body), Updated: updated})
+	}
+	comment := func(prefix string, c ghComment, prURL string) {
+		pr, ok := pulls[lastSegment(prURL)]
+		if !ok { // plain issue, other PR, or unparsable URL
+			slog.Debug("review poll: comment not on a tracked PR", "repo", repo, "id", prefix+strconv.FormatInt(c.ID, 10))
+			return
+		}
+		add(prefix, c.ID, pr, c.User, c.Body, c.UpdatedAt)
 	}
 	for _, c := range issueComments {
-		if !strings.Contains(c.HTMLURL, "/pull/") { // comment on a plain issue
-			continue
-		}
-		if err := add("ic:", c.ID, lastSegment(c.IssueURL), c.User, c.Body, c.UpdatedAt); err != nil {
-			return nil, err
-		}
+		comment("ic:", c, c.IssueURL)
 	}
 	for _, c := range reviewComments {
-		if err := add("rc:", c.ID, lastSegment(c.PullURL), c.User, c.Body, c.UpdatedAt); err != nil {
-			return nil, err
-		}
+		comment("rc:", c, c.PullURL)
 	}
 	for number, pr := range pulls {
-		if pr == nil {
-			continue
-		}
 		var reviews []ghReview // ponytail: first page (100) only; page like listSince if PRs get more reviews
 		if err := a.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%s/reviews?per_page=%d", repo, number, perPage), tok, nil, &reviews); err != nil {
 			return nil, err
 		}
 		for _, r := range reviews {
-			if r.State == reviewPending || r.Body == "" || r.SubmittedAt.Before(since) {
-				continue
-			}
-			if err := add("rv:", r.ID, number, r.User, r.Body, r.SubmittedAt); err != nil {
-				return nil, err
+			if r.State != reviewPending && r.Body != "" && !r.SubmittedAt.Before(since) {
+				add("rv:", r.ID, pr, r.User, r.Body, r.SubmittedAt)
 			}
 		}
 	}
 	return out, nil
 }
 
-// orchivioPull returns PR number of repo if its head branch starts with "orchivio/", else nil;
-// pulls caches the answers for one poll.
-func (a *App) orchivioPull(ctx context.Context, tok, repo, number string, pulls map[string]*ghPull) (*ghPull, error) {
-	if pr, ok := pulls[number]; ok {
-		return pr, nil
+// orchivioPulls returns, by number, the open PRs of repo updated since whose head branch
+// starts with "orchivio/" and lives in repo itself (fork PRs are ignored).
+func (a *App) orchivioPulls(ctx context.Context, tok, repo string, since time.Time) (map[string]ghPull, error) {
+	out := map[string]ghPull{}
+	for page := 1; ; page++ {
+		q := url.Values{"state": {"open"}, "sort": {"updated"}, "direction": {"desc"},
+			"per_page": {strconv.Itoa(perPage)}, "page": {strconv.Itoa(page)}}
+		var pulls []ghPull
+		if err := a.do(ctx, http.MethodGet, "/repos/"+repo+"/pulls?"+q.Encode(), tok, nil, &pulls); err != nil {
+			return nil, err
+		}
+		for _, pr := range pulls {
+			if pr.UpdatedAt.Before(since) {
+				return out, nil
+			}
+			if strings.HasPrefix(pr.Head.Ref, branchPrefix) && strings.EqualFold(pr.Head.Repo.FullName, repo) {
+				out[strconv.FormatInt(pr.Number, 10)] = pr
+			}
+		}
+		if len(pulls) < perPage {
+			return out, nil
+		}
 	}
-	if _, err := strconv.ParseInt(number, 10, 64); err != nil {
-		return nil, fmt.Errorf("github: unexpected pull request url in %s", repo)
-	}
-	var pr ghPull
-	if err := a.do(ctx, http.MethodGet, "/repos/"+repo+"/pulls/"+number, tok, nil, &pr); err != nil {
-		return nil, err
-	}
-	if !strings.HasPrefix(pr.Head.Ref, branchPrefix) {
-		pulls[number] = nil
-		return nil, nil
-	}
-	pulls[number] = &pr
-	return &pr, nil
-}
-
-// isOwn reports whether u is this App's bot user.
-func isOwn(u ghUser, slug string) bool {
-	return u.Type == "Bot" && strings.EqualFold(u.Login, slug+"[bot]")
 }
 
 func lastSegment(u string) string { return u[strings.LastIndex(u, "/")+1:] }
