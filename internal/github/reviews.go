@@ -18,6 +18,8 @@ const (
 	reviewOverlap = 2 * time.Minute
 	branchPrefix  = "orchivio/"
 	reviewPending = "PENDING"
+	// tokenRefresh mints a new review token this long before the cached one expires.
+	tokenRefresh = 5 * time.Minute
 )
 
 var reviewPerms = map[string]string{"pull_requests": "read", "metadata": "read"}
@@ -86,13 +88,14 @@ func (a *App) StreamReviews(ctx context.Context, installs []Installation, repos 
 		cursors[r] = a.now()
 	}
 	var b botMatcher
-	seen := map[string]time.Time{} // id -> updated; pruned once older than every window
+	tokens := map[string]cachedToken{} // lower-case owner -> read-only review token
+	seen := map[string]time.Time{}     // id -> updated; pruned once older than every window
 	for {
 		if b.mention == nil {
 			b = a.newBotMatcher(ctx)
 		}
 		if b.mention != nil {
-			for _, e := range a.pollReviews(ctx, installs, repos, cursors, b) {
+			for _, e := range a.pollReviews(ctx, installs, repos, cursors, tokens, b) {
 				if _, dup := seen[e.ID]; dup {
 					continue
 				}
@@ -152,19 +155,25 @@ func prune(seen, cursors map[string]time.Time) {
 	}
 }
 
+type cachedToken struct {
+	token   string
+	expires time.Time
+}
+
 // pollReviews fetches every repo from its cursor minus the overlap.
-// ponytail: one token per repo and poll; mint per owner and cache until expiry if rate limits bite.
-func (a *App) pollReviews(ctx context.Context, installs []Installation, repos []string, cursors map[string]time.Time, b botMatcher) []ReviewEvent {
+func (a *App) pollReviews(ctx context.Context, installs []Installation, repos []string, cursors map[string]time.Time, tokens map[string]cachedToken, b botMatcher) []ReviewEvent {
 	var out []ReviewEvent
 	for _, repo := range repos {
 		next := a.now()
-		tok, _, err := a.mint(ctx, installs, []string{repo}, reviewPerms)
+		owner, _, _ := strings.Cut(repo, "/")
+		tok, err := a.reviewToken(ctx, installs, owner, tokens)
 		if err == nil {
 			var events []ReviewEvent
 			events, err = a.repoReviews(ctx, tok, b, repo, cursors[repo].Add(-reviewOverlap))
 			out = append(out, events...)
 		}
 		if err != nil {
+			delete(tokens, strings.ToLower(owner)) // a rejected token must not stick until expiry
 			if ctx.Err() == nil {
 				slog.Warn("review poll failed", "repo", repo, "err", err.Error())
 			}
@@ -173,6 +182,22 @@ func (a *App) pollReviews(ctx context.Context, installs []Installation, repos []
 		cursors[repo] = next
 	}
 	return out
+}
+
+// reviewToken returns a read-only token for all repos of owner's installation, cached until
+// tokenRefresh before expiry: one mint per owner and hour instead of one per repo and poll.
+// It is not limited to the polled repos, so one deleted repo cannot fail the others' mint.
+func (a *App) reviewToken(ctx context.Context, installs []Installation, owner string, tokens map[string]cachedToken) (string, error) {
+	key := strings.ToLower(owner)
+	if c, ok := tokens[key]; ok && a.now().Before(c.expires.Add(-tokenRefresh)) {
+		return c.token, nil
+	}
+	tok, exp, err := a.mintFor(ctx, installs, owner, map[string]any{"permissions": reviewPerms})
+	if err != nil {
+		return "", err
+	}
+	tokens[key] = cachedToken{token: tok, expires: exp}
+	return tok, nil
 }
 
 // repoReviews returns the events of one repo updated (reviews: submitted) since, on its open

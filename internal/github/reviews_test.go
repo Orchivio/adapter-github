@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -310,5 +311,47 @@ func TestAPIErrorStatusMapsToSentinels(t *testing.T) {
 	}
 	if errors.Is(&apiError{status: http.StatusInternalServerError}, ErrNotFound) {
 		t.Fatal("500 must not match ErrNotFound")
+	}
+}
+
+func TestStreamMintsOneCachedTokenPerOwner(t *testing.T) {
+	a := &reviewStub{repo: "acme/a", pulls: `[]`}
+	b := &reviewStub{repo: "acme/b", pulls: `[]`}
+	mux := http.NewServeMux()
+	var mints atomic.Int32
+	var bodies []tokenReq
+	mux.HandleFunc("POST /app/installations/77/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		mints.Add(1)
+		var tr tokenReq
+		_ = json.NewDecoder(r.Body).Decode(&tr)
+		bodies = append(bodies, tr)
+		io.WriteString(w, `{"token":"ghs_read","expires_at":"2026-01-02T04:04:05Z"}`)
+	})
+	mux.HandleFunc("GET /app", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{"slug":"orchivio"}`) })
+	a.register(t, mux)
+	b.register(t, mux)
+	app, _ := newTestApp(t, mux)
+
+	stream(t, app, 2, "acme/a", "acme/b")
+
+	if mints.Load() != 1 || bodies[0].Repositories != nil || bodies[0].Permissions["pull_requests"] != "read" {
+		t.Fatalf("mints = %d, bodies = %+v; want one owner-wide read token", mints.Load(), bodies)
+	}
+}
+
+func TestReviewTokenRemintsShortlyBeforeExpiry(t *testing.T) {
+	var got []tokenReq
+	var mints atomic.Int32
+	app, _ := newTestApp(t, githubStub(t, &got, &mints))
+	tokens := map[string]cachedToken{}
+	if _, err := app.reviewToken(context.Background(), acme, "acme", tokens); err != nil {
+		t.Fatal(err)
+	}
+	app.now = func() time.Time { return time.Date(2026, 1, 2, 4, 0, 0, 0, time.UTC) } // 4m before expiry
+
+	tok, err := app.reviewToken(context.Background(), acme, "ACME", tokens)
+
+	if err != nil || tok != "ghs_tok" || mints.Load() != 2 {
+		t.Fatalf("tok=%q err=%v mints=%d", tok, err, mints.Load())
 	}
 }
