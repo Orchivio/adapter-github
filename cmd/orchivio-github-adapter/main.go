@@ -30,6 +30,7 @@ const (
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	slog.SetDefault(log) // internal/github logs failed polls via slog
 	if err := run(log); err != nil {
 		log.Error("fatal", "error", err.Error())
 		os.Exit(1)
@@ -68,13 +69,19 @@ func run(log *slog.Logger) error {
 		APIURL: env("GITHUB_API_URL", defaultAPI), WebURL: env("GITHUB_OAUTH_URL", defaultWeb),
 		AppID: appID, Key: key, ClientID: clientID, ClientSecret: clientSecret, Now: time.Now,
 	})
+	interval, err := time.ParseDuration(env("GITHUB_POLL_INTERVAL", server.DefaultPollInterval.String()))
+	if err != nil || interval <= 0 {
+		return fmt.Errorf("GITHUB_POLL_INTERVAL must be a positive duration")
+	}
 	lis, err := net.Listen("tcp", env("ORCHIVIO_GRPC_ADDR", defaultAddr))
 	if err != nil {
 		return err
 	}
 	// ponytail: insecure gRPC (dev, localhost); add TLS/mTLS before exposing beyond the host.
 	g := grpc.NewServer()
-	pluginv1.RegisterCodeHostAdapterServer(g, server.New(app, defaultCloneB))
+	srv := server.New(app, defaultCloneB)
+	srv.PollInterval = interval
+	pluginv1.RegisterCodeHostAdapterServer(g, srv)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
