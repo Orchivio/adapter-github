@@ -175,10 +175,11 @@ func installations(creds []*pluginv1.Credential) ([]github.Installation, error) 
 	return out, nil
 }
 
-// toStatus maps: invalid input -> InvalidArgument, GitHub 404 -> NotFound, GitHub 401 ->
-// Unauthenticated, owner without usable installation and
+// toStatus maps: invalid input -> InvalidArgument, GitHub 404 -> NotFound, owner without usable installation and
 // pending install request -> FailedPrecondition, user without access -> PermissionDenied,
-// everything else (GitHub 4xx/5xx, network) -> Unavailable. Messages come from our own
+// everything else (GitHub 4xx/5xx, network) -> Unavailable. A GitHub 401 stays Unavailable on
+// purpose: it means the App JWT was rejected, which is app-wide, not one tenant's grant, so
+// Unauthenticated would wrongly mark every tenant needs_reauth. Messages come from our own
 // error types, which carry only status and GitHub's message, never tokens.
 func toStatus(err error) error {
 	switch {
@@ -190,8 +191,6 @@ func toStatus(err error) error {
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, github.ErrNotFound):
 		return status.Error(codes.NotFound, err.Error())
-	case errors.Is(err, github.ErrUnauthenticated):
-		return status.Error(codes.Unauthenticated, err.Error())
 	default:
 		return status.Error(codes.Unavailable, err.Error())
 	}

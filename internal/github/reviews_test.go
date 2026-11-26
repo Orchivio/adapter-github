@@ -305,8 +305,8 @@ func TestStreamRejectsInvalidRepos(t *testing.T) {
 }
 
 func TestAPIErrorStatusMapsToSentinels(t *testing.T) {
-	if !errors.Is(&apiError{status: http.StatusNotFound}, ErrNotFound) || !errors.Is(&apiError{status: http.StatusUnauthorized}, ErrUnauthenticated) {
-		t.Fatal("404/401 must match ErrNotFound/ErrUnauthenticated")
+	if !errors.Is(&apiError{status: http.StatusNotFound}, ErrNotFound) {
+		t.Fatal("404 must match ErrNotFound")
 	}
 	if errors.Is(&apiError{status: http.StatusInternalServerError}, ErrNotFound) {
 		t.Fatal("500 must not match ErrNotFound")

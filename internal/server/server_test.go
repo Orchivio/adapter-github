@@ -111,7 +111,7 @@ func TestErrorsMapToGRPCCodes(t *testing.T) {
 		{github.ErrPendingApproval, codes.FailedPrecondition},
 		{github.ErrAccessDenied, codes.PermissionDenied},
 		{fmt.Errorf("x: %w", github.ErrNotFound), codes.NotFound},
-		{fmt.Errorf("x: %w", github.ErrUnauthenticated), codes.Unauthenticated},
+		{errors.New("GitHub API 401: Bad credentials"), codes.Unavailable}, // app-wide JWT, not tenant reauth
 		{errors.New("GitHub API 500: boom"), codes.Unavailable},
 	}
 	for _, c := range cases {
